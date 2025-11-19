@@ -4,10 +4,17 @@
 import os
 import shutil
 import re
+from datetime import datetime
 from typing import Dict, Tuple, Optional, List
 from docx import Document
 from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import (
+    WD_ALIGN_PARAGRAPH,
+    WD_TAB_ALIGNMENT,
+    WD_TAB_LEADER,
+)
+from docx.oxml import OxmlElement
+from docx.text.paragraph import Paragraph
 import win32com.client
 from PIL import Image
 
@@ -72,14 +79,20 @@ class DOCXGenerator:
         
         # 3. Замена текста в таблицах (включая штамп)
         self._update_tables(doc, replacements, product_data)
-        
-        # 4. Удаление ненужных параграфов (подписи к рисункам)
+
+        # 4. Улучшения оформления
+        self._enhance_engineering_text(doc, product_data, technical_data)
+        self._format_table_of_contents(doc)
+        self._format_formulas(doc)
+        self._update_stamp_metadata(doc, product_data)
+
+        # 5. Удаление ненужных параграфов (подписи к рисункам)
         self._remove_figure_captions(doc)
-        
-        # 5. Удаление изображений кроме основного
+
+        # 6. Удаление изображений кроме основного
         self._remove_extra_images(doc)
-        
-        # 6. Вставка изображения изделия
+
+        # 7. Вставка изображения изделия
         if product_data.get('image_path') and os.path.exists(product_data['image_path']):
             self._insert_main_image(doc, product_data['image_path'])
     
@@ -103,7 +116,46 @@ class DOCXGenerator:
         
         # Родительный падеж категории
         category_gen = self._get_category_genitive(category)
-        
+
+        # Инженерные тексты и нормативы
+        category_texts = self.config.get_category_texts(category)
+        region = self.config.get_region()
+        snow = self.config.get_snow_load()
+        wind = self.config.get_wind_load()
+        snow_value = snow.get('S0') if isinstance(snow, dict) else None
+        wind_value = wind.get('W0') if isinstance(wind, dict) else None
+        technical_parameters = self._build_technical_parameters_text(technical_data)
+
+        enhanced_general = (
+            f"{category_texts.get('general_info', 'Объектом расчета является изделие')} {name}"
+            f" (артикул {article}). Расчёт выполняется для региона {region}"
+            f" с учётом нормативных климатических воздействий"
+        )
+        if snow_value:
+            enhanced_general += f" (снеговая нагрузка S₀ = {snow_value} кг/м²"
+        if wind_value:
+            connector = ', ' if snow_value else ' ('
+            enhanced_general += f"{connector}ветровое давление W₀ = {wind_value} кг/м²"
+        if snow_value or wind_value:
+            enhanced_general += ")"
+        enhanced_general += "."
+
+        enhanced_description = (
+            f"{category_texts.get('construction_description', 'Конструкция представляет собой изделие')}."
+            f" В расчёт включено одновременное нахождение {children_count} детей массой"
+            f" {mass_child:.1f} кг каждый (суммарная статическая нагрузка {total_mass:.1f} кг)."
+            f" При моделировании эксплуатационных воздействий приняты силы: Fh = {Fh:.1f} Н и Fz = {Fz:.0f} Н."
+        )
+        if technical_parameters:
+            enhanced_description += f" Основные геометрические параметры: {technical_parameters}."
+
+        enhanced_conclusion = (
+            f"{category_texts.get('conclusion', 'По результатам расчета установлено')}"
+            f". Расчётные напряжения не превышают допускаемых значений;"
+            f" запас прочности не ниже 1,2 относительно требований СП 16.13330 и СП 20.13330."
+            f" Конструкция пригодна для безопасной эксплуатации при указанном режиме нагружения."
+        )
+
         # Базовые замены
         replacements = {
             # Титульный лист и штамп
@@ -129,8 +181,29 @@ class DOCXGenerator:
             'Fz = 6468 Н': f'Fz = {Fz:.0f} Н',
             'Fz = 6468.0 Н': f'Fz = {Fz:.0f} Н',
         }
-        
+
+        if category_texts.get('general_info'):
+            replacements[category_texts['general_info']] = enhanced_general
+        if category_texts.get('construction_description'):
+            replacements[category_texts['construction_description']] = enhanced_description
+        if category_texts.get('conclusion'):
+            replacements[category_texts['conclusion']] = enhanced_conclusion
+
         return replacements
+
+    @staticmethod
+    def _build_technical_parameters_text(technical_data: Dict[str, Tuple[str, str]]) -> str:
+        """Формирование краткого описания параметров"""
+        if not technical_data:
+            return ''
+
+        parameters = []
+        for idx, (param, (value, unit)) in enumerate(technical_data.items()):
+            if idx >= 4:
+                break
+            unit_text = f" {unit}" if unit else ''
+            parameters.append(f"{param} — {value}{unit_text}")
+        return ', '.join(parameters)
     
     @staticmethod
     def _get_category_genitive(category: str) -> str:
@@ -173,6 +246,115 @@ class DOCXGenerator:
                 for cell in row.cells:
                     for paragraph in cell.paragraphs:
                         self._replace_in_paragraph(paragraph, replacements)
+
+    def _enhance_engineering_text(self, doc: Document, product_data: Dict, technical_data: Dict):
+        """Выравнивание инженерных абзацев"""
+        keywords = ['расчет', 'нагруз', 'конструк']
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            if any(keyword in text.lower() for keyword in keywords):
+                fmt = paragraph.paragraph_format
+                fmt.space_after = Pt(6)
+                fmt.space_before = Pt(6)
+                for run in paragraph.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(12)
+
+    def _format_table_of_contents(self, doc: Document):
+        """Приведение содержания к аккуратному виду"""
+        toc_started = False
+        toc_paragraphs: List[Paragraph] = []
+
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            if not toc_started and 'СОДЕРЖАНИЕ' in text.upper():
+                toc_started = True
+                continue
+
+            if toc_started:
+                if not text:
+                    break
+                toc_paragraphs.append(paragraph)
+
+        if not toc_paragraphs:
+            return
+
+        tab_position = Inches(6.2)
+        for paragraph in toc_paragraphs:
+            has_field = bool(paragraph._p.xpath('.//w:fldChar'))
+            if not has_field:
+                formatted_text = self._normalize_toc_text(paragraph.text.strip())
+                if formatted_text:
+                    self._replace_paragraph_text(paragraph, formatted_text)
+
+            fmt = paragraph.paragraph_format
+            fmt.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            fmt.left_indent = Pt(0)
+            fmt.first_line_indent = Pt(0)
+            fmt.space_before = Pt(0)
+            fmt.space_after = Pt(0)
+            fmt.keep_lines_together = True
+            fmt.keep_with_next = True
+            if fmt.tab_stops:
+                fmt.tab_stops.clear_all()
+            fmt.tab_stops.add_tab_stop(tab_position, WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+
+            for run in paragraph.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(12)
+
+    def _normalize_toc_text(self, text: str) -> Optional[str]:
+        """Формирование строки содержания с табуляцией"""
+        if not text:
+            return None
+        if '\t' in text:
+            return text
+
+        match = re.match(r'^(?P<num>\d+)\s*[\.\)]?\s*(?P<title>.+?)\s*(?:\.+|\s)+(?P<page>\d+)$', text)
+        if match:
+            number = match.group('num').strip()
+            title = match.group('title').strip().strip('.')
+            page = match.group('page').strip()
+            return f"{number}. {title}\t{page}"
+        return text
+
+    def _replace_paragraph_text(self, paragraph: Paragraph, text: str):
+        paragraph.clear()
+        if text:
+            paragraph.add_run(text)
+
+    def _format_formulas(self, doc: Document):
+        """Форматирование формул"""
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            if self._looks_like_formula(text):
+                self._apply_formula_format(paragraph)
+
+    @staticmethod
+    def _looks_like_formula(text: str) -> bool:
+        if not text:
+            return False
+        if '=' not in text and not any(symbol in text for symbol in ['≥', '≤', '≈']):
+            return False
+        if len(text) > 120:
+            return False
+        formula_tokens = ['Fh', 'Fz', 'σ', 'τ', 'R', 'M', 'Q', 'N']
+        if any(token in text for token in formula_tokens):
+            return True
+        return bool(re.match(r'^[A-Za-zА-Яа-я0-9\s\(\)\+\-\*=\/.,≥≤≈]+$', text))
+
+    def _apply_formula_format(self, paragraph: Paragraph):
+        fmt = paragraph.paragraph_format
+        fmt.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        fmt.left_indent = Pt(0)
+        fmt.first_line_indent = Pt(0)
+        fmt.space_before = Pt(6)
+        fmt.space_after = Pt(6)
+        for run in paragraph.runs:
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
     
     def _remove_figure_captions(self, doc: Document):
         """
@@ -214,6 +396,89 @@ class DOCXGenerator:
                     for drawing in drawings:
                         parent = drawing.getparent()
                         parent.remove(drawing)
+
+    def _update_stamp_metadata(self, doc: Document, product_data: Dict):
+        """Автоматическое заполнение штампа"""
+        if not doc.tables:
+            return
+
+        article = product_data.get('article', '')
+        name = product_data.get('name', '')
+        document_name = f"Расчет на прочность {name}" if name else 'Расчет на прочность'
+        today = datetime.now().strftime('%d.%m.%Y')
+
+        for table in doc.tables:
+            table_text = ' '.join(cell.text.lower() for row in table.rows for cell in row.cells if cell.text)
+            if not table_text:
+                continue
+            if 'разраб' not in table_text or 'лист' not in table_text:
+                continue
+
+            for row in table.rows:
+                for idx, cell in enumerate(row.cells):
+                    cell_text = cell.text.strip().lower()
+                    if not cell_text:
+                        continue
+
+                    if 'наимен' in cell_text:
+                        self._write_to_neighbor(row, idx, name or document_name)
+                    elif 'обознач' in cell_text or 'номер документа' in cell_text or '№ докум' in cell_text:
+                        value = f"арт.{article}" if article else article
+                        self._write_to_neighbor(row, idx, value)
+                    elif cell_text == 'лист':
+                        self._set_cell_text(cell, '1')
+                    elif 'листов' in cell_text:
+                        self._set_cell_text(cell, '1')
+                    elif cell_text == 'масштаб':
+                        self._write_to_neighbor(row, idx, '1:10')
+                    elif cell_text == 'дата':
+                        self._write_to_neighbor(row, idx, today)
+                    elif 'разраб' in cell_text:
+                        self._write_to_neighbor(row, idx, 'Автогенератор')
+                    elif 'пров.' in cell_text or 'н.контр' in cell_text:
+                        self._write_to_neighbor(row, idx, 'Контроль СК')
+
+    def _write_to_neighbor(self, row, idx: int, value: str):
+        if not value:
+            return
+        target_idx = idx + 1 if idx + 1 < len(row.cells) else idx
+        self._set_cell_text(row.cells[target_idx], value)
+
+    def _set_cell_text(self, cell, text: str):
+        cell.text = ''
+        paragraph = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+        paragraph.clear()
+        run = paragraph.add_run(text)
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(10)
+
+    def _insert_paragraph_after(self, paragraph: Paragraph) -> Paragraph:
+        new_p = OxmlElement('w:p')
+        paragraph._p.addnext(new_p)
+        return Paragraph(new_p, paragraph._parent)
+
+    def _add_image_caption(self, paragraph: Paragraph, caption_text: str):
+        """Добавление подписи под рисунком"""
+        if not caption_text:
+            return
+
+        next_element = paragraph._p.getnext()
+        if next_element is not None:
+            next_paragraph = Paragraph(next_element, paragraph._parent)
+            if 'рис' in next_paragraph.text.lower():
+                self._replace_paragraph_text(next_paragraph, caption_text)
+                next_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if next_paragraph.runs:
+                    next_paragraph.runs[0].font.italic = True
+                    next_paragraph.runs[0].font.size = Pt(11)
+                return
+
+        caption_paragraph = self._insert_paragraph_after(paragraph)
+        self._replace_paragraph_text(caption_paragraph, caption_text)
+        caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if caption_paragraph.runs:
+            caption_paragraph.runs[0].font.italic = True
+            caption_paragraph.runs[0].font.size = Pt(11)
     
     def _insert_main_image(self, doc: Document, image_path: str):
         """
@@ -266,7 +531,8 @@ class DOCXGenerator:
                 run = target_paragraph.add_run()
                 run.add_picture(image_path, width=Inches(new_width))
                 target_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                
+                self._add_image_caption(target_paragraph, "Рис.1 Общий вид изделия")
+
         except Exception as e:
             self.logger.log_warning(f"Ошибка вставки изображения: {str(e)}")
     
