@@ -21,6 +21,10 @@ from PIL import Image
 
 class DOCXGenerator:
     """Класс для генерации документов Word"""
+
+    XML_NAMESPACES = {
+        'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+    }
     
     def __init__(self, template_path: str, output_dir: str, config_manager, logger):
         """
@@ -132,10 +136,10 @@ class DOCXGenerator:
             f" с учётом нормативных климатических воздействий"
         )
         if snow_value:
-            enhanced_general += f" (снеговая нагрузка S₀ = {snow_value} кг/м²"
+            enhanced_general += f" (снеговая нагрузка S0 = {snow_value} кг/м²"
         if wind_value:
             connector = ', ' if snow_value else ' ('
-            enhanced_general += f"{connector}ветровое давление W₀ = {wind_value} кг/м²"
+            enhanced_general += f"{connector}ветровое давление W0 = {wind_value} кг/м²"
         if snow_value or wind_value:
             enhanced_general += ")"
         enhanced_general += "."
@@ -384,18 +388,33 @@ class DOCXGenerator:
         Удаление всех изображений кроме основного
         """
         for paragraph in doc.paragraphs:
-            # Оставляем изображение только если рядом есть "Рис. 1" или "Общий вид"
-            keep_image = False
-            if 'Рис. 1' in paragraph.text or 'Общий вид' in paragraph.text:
-                keep_image = True
-            
-            # Удаляем изображения
-            if not keep_image:
-                for run in paragraph.runs:
-                    drawings = run._element.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing')
-                    for drawing in drawings:
-                        parent = drawing.getparent()
+            text_lower = paragraph.text.lower()
+            keep_image = (
+                'рис. 1' in text_lower or
+                'рис.1' in text_lower or
+                'общий вид' in text_lower
+            )
+
+            if keep_image:
+                continue
+
+            for run in paragraph.runs:
+                drawings = run._element.findall(
+                    './/{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing'
+                )
+                for drawing in drawings:
+                    if not self._is_inline_picture(drawing):
+                        continue
+                    parent = drawing.getparent()
+                    if parent is not None:
                         parent.remove(drawing)
+
+    def _is_inline_picture(self, drawing) -> bool:
+        """Проверка, является ли объект встроенным изображением"""
+        if drawing is None:
+            return False
+        inline_nodes = drawing.xpath('.//wp:inline', namespaces=self.XML_NAMESPACES)
+        return bool(inline_nodes)
 
     def _update_stamp_metadata(self, doc: Document, product_data: Dict):
         """Автоматическое заполнение штампа"""
